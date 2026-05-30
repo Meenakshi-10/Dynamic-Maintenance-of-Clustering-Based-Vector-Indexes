@@ -10,21 +10,15 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
+#include <tuple>
 
 #include <sys/stat.h>
-
 #include <sys/time.h>
 
 #include <faiss/AutoTune.h>
+#include <faiss/IndexIVF.h>
 #include <faiss/index_factory.h>
-
-/**
- * To run this demo, please download the ANN_SIFT1M dataset from
- *
- *   http://corpus-texmex.irisa.fr/
- *
- * and unzip it to the subdirectory sift1M.
- **/
 
 /*****************************************************
  * I/O functions for fvecs and ivecs
@@ -53,7 +47,6 @@ float* fvecs_read(const char* fname, size_t* d_out, size_t* n_out) {
     size_t nr __attribute__((unused)) = fread(x, sizeof(float), n * (d + 1), f);
     assert(nr == n * (d + 1) && "could not read whole file");
 
-    // shift array to remove row headers
     for (size_t i = 0; i < n; i++)
         memmove(x + i * d, x + 1 + i * (d + 1), d * sizeof(*x));
 
@@ -61,7 +54,6 @@ float* fvecs_read(const char* fname, size_t* d_out, size_t* n_out) {
     return x;
 }
 
-// not very clean, but works as long as sizeof(int) == sizeof(float)
 int* ivecs_read(const char* fname, size_t* d_out, size_t* n_out) {
     return (int*)fvecs_read(fname, d_out, n_out);
 }
@@ -75,196 +67,137 @@ double elapsed() {
 int main() {
     double t0 = elapsed();
 
-    // this is typically the fastest one.
-    const char* index_key = "IVF4096,Flat";
-
-    // these ones have better memory usage
-    // const char *index_key = "Flat";
-    // const char *index_key = "PQ32";
-    // const char *index_key = "PCA80,Flat";
-    // const char *index_key = "IVF4096,PQ8+16";
-    // const char *index_key = "IVF4096,PQ32";
-    // const char *index_key = "IMI2x8,PQ32";
-    // const char *index_key = "IMI2x8,PQ8+16";
-    // const char *index_key = "OPQ16_64,IMI2x8,PQ8+16";
+    const char* index_key  = "IVF4096,Flat";
+    const size_t n_initial = 100000; // vectors added before the growth loop
+    const size_t batch_size = 100;   // vectors per incremental batch
+    const size_t measure_every = 10; // measure recall every N batches
+    const int    nprobe = 64;        // fixed search parameter throughout
 
     faiss::Index* index;
-
     size_t d;
 
+    // ------------------------------------------------------------------ train
     {
-    printf("[%.3f s] Loading train set\n", elapsed() - t0);
+        printf("[%.3f s] Loading train set\n", elapsed() - t0);
+        size_t nt;
+        float* xt = fvecs_read("sift1M/sift_learn.fvecs", &d, &nt);
 
-    size_t nt;
-    float* xt = fvecs_read("sift1M/sift_learn.fvecs", &d, &nt);
+        printf("[%.3f s] Preparing index \"%s\" d=%ld\n",
+               elapsed() - t0, index_key, d);
+        index = faiss::index_factory(d, index_key);
 
-    // Also load base set and subsample 200k vectors for training
-    size_t nb_train, d2;
-    float* xb_train = fvecs_read("sift1M/sift_base.fvecs", &d2, &nb_train);
-
-    size_t n_extra = 200000;
-    float* xt_combined = new float[(nt + n_extra) * d];
-
-    // Copy original training set
-    memcpy(xt_combined, xt, nt * d * sizeof(float));
-
-    // Randomly sample n_extra vectors from base set
-    srand(42); // fixed seed for reproducibility
-    for (size_t i = 0; i < n_extra; i++) {
-        size_t idx = rand() % nb_train;
-        memcpy(xt_combined + (nt + i) * d, xb_train + idx * d, d * sizeof(float));
+        printf("[%.3f s] Training on %ld vectors\n", elapsed() - t0, nt);
+        index->train(nt, xt);
+        delete[] xt;
     }
 
-    size_t nt_combined = nt + n_extra;
-
-    printf("[%.3f s] Preparing index \"%s\" d=%ld\n", elapsed() - t0, index_key, d);
-    index = faiss::index_factory(d, index_key);
-
-    printf("[%.3f s] Training on %ld vectors\n", elapsed() - t0, nt_combined);
-    index->train(nt_combined, xt_combined);
-
-    delete[] xt;
-    delete[] xb_train;
-    delete[] xt_combined;
-}
-
+    // --------------------------------------------------------------- load base
+    size_t nb;
+    float* xb;
     {
-        printf("[%.3f s] Loading database\n", elapsed() - t0);
-
-        size_t nb, d2;
-        float* xb = fvecs_read("sift1M/sift_base.fvecs", &d2, &nb);
-        assert(d == d2 && "dataset does not have same dimension as train set");
-
-        printf("[%.3f s] Indexing database, size %ld*%ld\n",
-               elapsed() - t0,
-               nb,
-               d);
-
-        index->add(nb, xb);
-
-        delete[] xb;
+        size_t d2;
+        xb = fvecs_read("sift1M/sift_base.fvecs", &d2, &nb);
+        assert(d == d2 && "base dimension mismatch");
+        printf("[%.3f s] Loaded base set: %ld vectors\n", elapsed() - t0, nb);
     }
 
+    // ---------------------------------------------------------- initial add()
+    assert(n_initial <= nb && "n_initial exceeds base set size");
+    printf("[%.3f s] Adding initial %ld vectors\n", elapsed() - t0, n_initial);
+    index->add(n_initial, xb);
+
+    // ---------------------------------------------------------- load queries
     size_t nq;
     float* xq;
-
     {
-        printf("[%.3f s] Loading queries\n", elapsed() - t0);
-
         size_t d2;
         xq = fvecs_read("sift1M/sift_query.fvecs", &d2, &nq);
-        assert(d == d2 && "query does not have same dimension as train set");
+        assert(d == d2 && "query dimension mismatch");
+        printf("[%.3f s] Loaded %ld queries\n", elapsed() - t0, nq);
     }
 
-    size_t k;         // nb of results per query in the GT
-    faiss::idx_t* gt; // nq * k matrix of ground-truth nearest-neighbors
-
+    // ------------------------------------------------------- load ground truth
+    // Ground truth is against the full 1M base set, so recall will naturally
+    // start low and rise as the true nearest neighbours are added to the index.
+    size_t k;
+    faiss::Index::idx_t* gt;
     {
-        printf("[%.3f s] Loading ground truth for %ld queries\n",
-               elapsed() - t0,
-               nq);
-
-        // load ground-truth and convert int to long
         size_t nq2;
         int* gt_int = ivecs_read("sift1M/sift_groundtruth.ivecs", &k, &nq2);
-        assert(nq2 == nq && "incorrect nb of ground truth entries");
-
-        gt = new faiss::idx_t[k * nq];
-        for (int i = 0; i < k * nq; i++) {
+        assert(nq2 == nq && "ground-truth query count mismatch");
+        gt = new faiss::Index::idx_t[k * nq];
+        for (size_t i = 0; i < k * nq; i++)
             gt[i] = gt_int[i];
-        }
         delete[] gt_int;
+        printf("[%.3f s] Loaded ground truth (k=%ld)\n", elapsed() - t0, k);
     }
 
-    // Result of the auto-tuning
-    std::string selected_params;
-
-    { // run auto-tuning
-
-        printf("[%.3f s] Preparing auto-tune criterion 1-recall at 1 "
-               "criterion, with k=%ld nq=%ld\n",
-               elapsed() - t0,
-               k,
-               nq);
-
-        faiss::OneRecallAtRCriterion crit(nq, 1);
-        crit.set_groundtruth(k, nullptr, gt);
-        crit.nnn = k; // by default, the criterion will request only 1 NN
-
-        printf("[%.3f s] Preparing auto-tune parameters\n", elapsed() - t0);
-
-        faiss::ParameterSpace params;
-        params.initialize(index);
-
-        printf("[%.3f s] Auto-tuning over %ld parameters (%ld combinations)\n",
-               elapsed() - t0,
-               params.parameter_ranges.size(),
-               params.n_combinations());
-
-        faiss::OperatingPoints ops;
-        params.explore(index, nq, xq, crit, &ops);
-
-        printf("[%.3f s] Found the following operating points: \n",
-               elapsed() - t0);
-
-        ops.display();
-
-        // keep the first parameter that obtains > 0.5 1-recall@1
-        for (int i = 0; i < ops.optimal_pts.size(); i++) {
-            if (ops.optimal_pts[i].perf > 0.5) {
-                selected_params = ops.optimal_pts[i].key;
-                break;
-            }
-        }
-        assert(selected_params.size() >= 0 &&
-               "could not find good enough op point");
+    // ------------------------------------------- fix nprobe for all searches
+    {
+        faiss::IndexIVF* ivf = dynamic_cast<faiss::IndexIVF*>(index);
+        assert(ivf && "expected an IVF index");
+        ivf->nprobe = nprobe;
+        printf("[%.3f s] nprobe set to %d\n", elapsed() - t0, nprobe);
     }
 
-    { // Use the found configuration to perform a search
+    // -------------------------------------------------- recall helper lambda
+    faiss::Index::idx_t* I = new faiss::Index::idx_t[nq * k];
+    float*               D = new float[nq * k];
 
-        faiss::ParameterSpace params;
-
-        printf("[%.3f s] Setting parameter configuration \"%s\" on index\n",
-               elapsed() - t0,
-               selected_params.c_str());
-
-        params.set_index_parameters(index, selected_params.c_str());
-
-        printf("[%.3f s] Perform a search on %ld queries\n",
-               elapsed() - t0,
-               nq);
-
-        // output buffers
-        faiss::idx_t* I = new faiss::idx_t[nq * k];
-        float* D = new float[nq * k];
-
+    auto measure_recall = [&]() -> std::tuple<float, float, float> {
         index->search(nq, xq, k, D, I);
-
-        printf("[%.3f s] Compute recalls\n", elapsed() - t0);
-
-        // evaluate result by hand.
         int n_1 = 0, n_10 = 0, n_100 = 0;
-        for (int i = 0; i < nq; i++) {
-            int gt_nn = gt[i * k];
-            for (int j = 0; j < k; j++) {
+        for (size_t i = 0; i < nq; i++) {
+            faiss::Index::idx_t gt_nn = gt[i * k];
+            for (size_t j = 0; j < k; j++) {
                 if (I[i * k + j] == gt_nn) {
-                    if (j < 1)
-                        n_1++;
-                    if (j < 10)
-                        n_10++;
-                    if (j < 100)
-                        n_100++;
+                    if (j < 1)   n_1++;
+                    if (j < 10)  n_10++;
+                    if (j < 100) n_100++;
                 }
             }
         }
-        printf("R@1 = %.4f\n", n_1 / float(nq));
-        printf("R@10 = %.4f\n", n_10 / float(nq));
-        printf("R@100 = %.4f\n", n_100 / float(nq));
+        return {n_1 / float(nq), n_10 / float(nq), n_100 / float(nq)};
+    };
 
-        delete[] I;
-        delete[] D;
+    // ----------------------------------------- recall at the initial snapshot
+    {
+        auto [r1, r10, r100] = measure_recall();
+        printf("[%.3f s] ntotal=%7lld  R@1=%.4f  R@10=%.4f  R@100=%.4f\n",
+               elapsed() - t0, index->ntotal, r1, r10, r100);
     }
 
+    // ---------------------------------------------- incremental growth loop
+    size_t n_remaining = nb - n_initial;
+    size_t n_batches   = n_remaining / batch_size;
+
+    printf("[%.3f s] Growing index: %ld batches x %ld vectors "
+           "(measuring every %ld batches)\n",
+           elapsed() - t0, n_batches, batch_size, measure_every);
+
+    for (size_t b = 0; b < n_batches; b++) {
+        size_t offset = n_initial + b * batch_size;
+        index->add(batch_size, xb + offset * d);
+
+        if ((b + 1) % measure_every == 0) {
+            auto [r1, r10, r100] = measure_recall();
+            printf("[%.3f s] ntotal=%7lld  R@1=%.4f  R@10=%.4f  R@100=%.4f\n",
+                   elapsed() - t0, index->ntotal, r1, r10, r100);
+        }
+    }
+
+    // ---------------------------------------------------- flush any remainder
+    size_t added = n_initial + n_batches * batch_size;
+    if (added < nb) {
+        index->add(nb - added, xb + added * d);
+        auto [r1, r10, r100] = measure_recall();
+        printf("[%.3f s] ntotal=%7lld  R@1=%.4f  R@10=%.4f  R@100=%.4f  [final]\n",
+               elapsed() - t0, index->ntotal, r1, r10, r100);
+    }
+
+    delete[] I;
+    delete[] D;
+    delete[] xb;
     delete[] xq;
     delete[] gt;
     delete index;
