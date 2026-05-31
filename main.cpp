@@ -12,6 +12,7 @@
 #include <cstring>
 #include <string>
 #include <tuple>
+#include <fstream>
 
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -141,6 +142,9 @@ int main() {
     }
 
     // -------------------------------------------------- recall helper lambda
+    std::ofstream metrics_file("recall_metrics.csv");
+    metrics_file << "ntotal,R@1,R@10,R@100\n";
+
     faiss::Index::idx_t* I = new faiss::Index::idx_t[nq * k];
     float*               D = new float[nq * k];
 
@@ -148,14 +152,16 @@ int main() {
         index->search(nq, xq, k, D, I);
         int n_1 = 0, n_10 = 0, n_100 = 0;
         for (size_t i = 0; i < nq; i++) {
-            faiss::Index::idx_t gt_nn = gt[i * k];
-            for (size_t j = 0; j < k; j++) {
-                if (I[i * k + j] == gt_nn) {
-                    if (j < 1)   n_1++;
-                    if (j < 10)  n_10++;
-                    if (j < 100) n_100++;
-                }
-            }
+            // R@r: any of the true top-r GT neighbors found in retrieved top-r
+            auto hit = [&](size_t r) -> bool {
+                for (size_t j = 0; j < r; j++)
+                    for (size_t g = 0; g < r; g++)
+                        if (I[i * k + j] == gt[i * k + g]) return true;
+                return false;
+            };
+            if (hit(1))   n_1++;
+            if (hit(10))  n_10++;
+            if (hit(100)) n_100++;
         }
         return {n_1 / float(nq), n_10 / float(nq), n_100 / float(nq)};
     };
@@ -165,6 +171,7 @@ int main() {
         auto [r1, r10, r100] = measure_recall();
         printf("[%.3f s] ntotal=%7lld  R@1=%.4f  R@10=%.4f  R@100=%.4f\n",
                elapsed() - t0, index->ntotal, r1, r10, r100);
+        metrics_file << index->ntotal << "," << r1 << "," << r10 << "," << r100 << "\n";
     }
 
     // ---------------------------------------------- incremental growth loop
@@ -183,6 +190,7 @@ int main() {
             auto [r1, r10, r100] = measure_recall();
             printf("[%.3f s] ntotal=%7lld  R@1=%.4f  R@10=%.4f  R@100=%.4f\n",
                    elapsed() - t0, index->ntotal, r1, r10, r100);
+            metrics_file << index->ntotal << "," << r1 << "," << r10 << "," << r100 << "\n";
         }
     }
 
@@ -193,8 +201,10 @@ int main() {
         auto [r1, r10, r100] = measure_recall();
         printf("[%.3f s] ntotal=%7lld  R@1=%.4f  R@10=%.4f  R@100=%.4f  [final]\n",
                elapsed() - t0, index->ntotal, r1, r10, r100);
+        metrics_file << index->ntotal << "," << r1 << "," << r10 << "," << r100 << "\n";
     }
 
+    metrics_file.close();
     delete[] I;
     delete[] D;
     delete[] xb;
