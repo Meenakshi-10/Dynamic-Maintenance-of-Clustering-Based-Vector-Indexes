@@ -69,7 +69,7 @@ int main() {
     double t0 = elapsed();
 
     const char* index_key  = "IVF4096,Flat";
-    const size_t n_initial = 100000; // vectors added before the growth loop
+    const size_t n_initial = 100,000; // vectors added before the growth loop
     const size_t batch_size = 100;   // vectors per incremental batch
     const size_t measure_every = 10; // measure recall every N batches
     const int    nprobe = 64;        // fixed search parameter throughout
@@ -78,6 +78,7 @@ int main() {
     size_t d;
 
     // ------------------------------------------------------------------ train
+    //after this, we have 4096 centroids without any vectors assigned to them
     {
         printf("[%.3f s] Loading train set\n", elapsed() - t0);
         size_t nt;
@@ -175,8 +176,8 @@ int main() {
     }
 
     // ---------------------------------------------- incremental growth loop
-    size_t n_remaining = nb - n_initial;
-    size_t n_batches   = n_remaining / batch_size;
+    size_t n_remaining = nb - n_initial; //900,000
+    size_t n_batches   = n_remaining / batch_size; //9000
 
     printf("[%.3f s] Growing index: %ld batches x %ld vectors "
            "(measuring every %ld batches)\n",
