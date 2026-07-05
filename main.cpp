@@ -1,12 +1,14 @@
 /*
- * Staleness simulator for IVF index.
- * 
- * Builds a frozen IVF index on an initial snapshot, then simulates
- * dataset mutations (additions only for now) by updating a brute-force
- * ground truth index while leaving the IVF index frozen.
- * 
- * Recall is measured against dynamic ground truth, so it degrades
- * over time as the frozen index falls behind the live dataset.
+ * Staleness simulator for IVF index — comparison of frozen vs. mutable.
+ *
+ * Builds three indexes on the same initial snapshot:
+ *   1. A brute-force ground truth index (IndexFlatL2), which tracks every mutation.
+ *   2. A frozen IVF4096,Flat index that never sees mutations (baseline for staleness).
+ *   3. A mutable IVF4096,Flat (IndexIVFMutable) that receives every mutation and
+ *      updates centroids incrementally via streaming-mean perturbation.
+ *
+ * On each measurement step we run the same query batch against all three,
+ * compute recall of (2) vs. (1) and recall of (3) vs. (1), and log both.
  *
  * R@X = average fraction of true top-X neighbors recovered across all queries.
  */
@@ -19,6 +21,7 @@
 #include <string>
 #include <tuple>
 #include <fstream>
+#include <unordered_set>
 
 #include <sys/stat.h>
 #include <sys/time.h>
@@ -26,6 +29,8 @@
 #include <faiss/AutoTune.h>
 #include <faiss/IndexFlat.h>
 #include <faiss/IndexIVF.h>
+#include <faiss/IndexIVFFlat.h>
+#include <faiss/IndexIVFMutable.h>
 #include <faiss/index_factory.h>
 
 /*****************************************************
@@ -76,27 +81,43 @@ int main() {
     double t0 = elapsed();
 
     // ------------------------------------------------------------------ config
-    const char* index_key    = "IVF4096,Flat";
-    const size_t n_initial   = 100000; // snapshot size — index is frozen after this
-    const size_t batch_size  = 100;    // vectors added to dataset per mutation step
+    const size_t nlist       = 4096;
+    const size_t n_initial   = 100000; // snapshot size — frozen index stops here
+    const size_t batch_size  = 100;    // vectors added per mutation step
     const size_t measure_every = 10;   // measure recall every N batches
     const int    nprobe      = 64;     // fixed for all IVF searches
 
-    faiss::Index* index = nullptr;
     size_t d = 0;
 
     // ------------------------------------------------------------------ train
+    // Both IVF indexes are trained on the same learn set, so their initial
+    // centroids are identical. The subsequent divergence is purely due to
+    // the mutable index's perturbation updates.
+    faiss::IndexFlatL2* frozen_quantizer = nullptr;
+    faiss::IndexFlatL2* mutable_quantizer = nullptr;
+    faiss::IndexIVFFlat* frozen_index = nullptr;
+    faiss::IndexIVFMutable* mutable_index = nullptr;
+
     {
         printf("[%.3f s] Loading train set\n", elapsed() - t0);
         size_t nt;
         float* xt = fvecs_read("sift1M/sift_learn.fvecs", &d, &nt);
 
-        printf("[%.3f s] Preparing index \"%s\" d=%ld\n",
-               elapsed() - t0, index_key, d);
-        index = faiss::index_factory(d, index_key);
+        printf("[%.3f s] Building frozen IVF4096,Flat  d=%ld\n",
+               elapsed() - t0, d);
+        frozen_quantizer = new faiss::IndexFlatL2(d);
+        frozen_index = new faiss::IndexIVFFlat(frozen_quantizer, d, nlist);
+        frozen_index->own_fields = true;   // frozen_index will delete its quantizer
 
-        printf("[%.3f s] Training on %ld vectors\n", elapsed() - t0, nt);
-        index->train(nt, xt);
+        printf("[%.3f s] Building mutable IVF4096,Flat d=%ld\n",
+               elapsed() - t0, d);
+        mutable_quantizer = new faiss::IndexFlatL2(d);
+        mutable_index = new faiss::IndexIVFMutable(mutable_quantizer, d, nlist);
+        mutable_index->own_fields = true;
+
+        printf("[%.3f s] Training both on %ld vectors\n", elapsed() - t0, nt);
+        frozen_index->train(nt, xt);
+        mutable_index->train(nt, xt);
         delete[] xt;
     }
 
@@ -110,25 +131,21 @@ int main() {
         printf("[%.3f s] Loaded base set: %ld vectors\n", elapsed() - t0, nb);
     }
 
-    // ------------------------------------------------- build frozen IVF index
-    // The IVF index is populated with the initial snapshot and never updated
-    // again. This is the "stale" index we are measuring recall degradation for.
+    // ------------------------------------------- populate initial snapshot
+    // All three indexes start with the same 100k vectors. After this point,
+    // the frozen index stops receiving vectors; the ground-truth and mutable
+    // indexes continue to receive every mutation.
     assert(n_initial <= nb && "n_initial exceeds base set size");
-    printf("[%.3f s] Building frozen index on initial %ld vectors\n",
+    printf("[%.3f s] Adding initial %ld vectors to all three indexes\n",
            elapsed() - t0, n_initial);
-    index->add(n_initial, xb);
+    frozen_index->add(n_initial, xb);
+    mutable_index->add(n_initial, xb);
 
-    {
-        faiss::IndexIVF* ivf = dynamic_cast<faiss::IndexIVF*>(index);
-        assert(ivf && "expected an IVF index");
-        ivf->nprobe = nprobe;
-        printf("[%.3f s] nprobe set to %d\n", elapsed() - t0, nprobe);
-    }
+    frozen_index->nprobe = nprobe;
+    mutable_index->nprobe = nprobe;
+    printf("[%.3f s] nprobe set to %d on both IVF indexes\n",
+           elapsed() - t0, nprobe);
 
-    // ------------------------------------------------- build ground truth index
-    // This is a brute-force flat index that receives every mutation.
-    // It always reflects the current true state of the dataset, so searching
-    // it gives us the exact nearest neighbors to compare against.
     printf("[%.3f s] Building ground truth index on initial %ld vectors\n",
            elapsed() - t0, n_initial);
     faiss::IndexFlatL2* gt_index = new faiss::IndexFlatL2(d);
@@ -145,62 +162,80 @@ int main() {
     }
 
     // ---------------------------------------------------------- search buffers
-    // k is the number of neighbors we retrieve and evaluate recall at.
-    // We use 100 to support R@1, R@10, R@100.
     const size_t k = 100;
-    faiss::Index::idx_t* I    = new faiss::Index::idx_t[nq * k]; // IVF results
-    float*               D    = new float[nq * k];
-    faiss::Index::idx_t* I_gt = new faiss::Index::idx_t[nq * k]; // GT results
-    float*               D_gt = new float[nq * k];
+    faiss::Index::idx_t* I_frozen  = new faiss::Index::idx_t[nq * k];
+    float*               D_frozen  = new float[nq * k];
+    faiss::Index::idx_t* I_mutable = new faiss::Index::idx_t[nq * k];
+    float*               D_mutable = new float[nq * k];
+    faiss::Index::idx_t* I_gt      = new faiss::Index::idx_t[nq * k];
+    float*               D_gt      = new float[nq * k];
 
     // -------------------------------------------------- recall helper lambda
-    // For each query, counts how many of the true top-X neighbors appear in
-    // the retrieved top-X results, divides by X, then averages across queries.
-    // This matches R@X = average fraction of true top-X neighbors recovered.
-    auto measure_recall = [&]() -> std::tuple<float, float, float> {
-        // search the frozen stale IVF index
-        index->search(nq, xq, k, D, I);
-
-        // compute current ground truth from live brute force index
+    // Set-based recall: for each query, count how many IDs from the true top-r
+    // appear in the retrieved top-r, divide by r, average across queries.
+    // Set membership avoids the double-counting issue of nested loops.
+    auto measure_recalls = [&]() -> std::tuple<std::tuple<float,float,float>,
+                                                std::tuple<float,float,float>> {
+        frozen_index->search(nq, xq, k, D_frozen, I_frozen);
+        mutable_index->search(nq, xq, k, D_mutable, I_mutable);
         gt_index->search(nq, xq, k, D_gt, I_gt);
 
-        float r1 = 0, r10 = 0, r100 = 0;
+        float fr1 = 0, fr10 = 0, fr100 = 0;
+        float mr1 = 0, mr10 = 0, mr100 = 0;
+
+        auto recall_at_r = [&](size_t i, size_t r,
+                               const faiss::Index::idx_t* retrieved) -> float {
+            std::unordered_set<faiss::Index::idx_t> truth;
+            for (size_t g = 0; g < r; g++)
+                truth.insert(I_gt[i * k + g]);
+            int hits = 0;
+            for (size_t j = 0; j < r; j++)
+                if (truth.count(retrieved[i * k + j])) hits++;
+            return float(hits) / float(r);
+        };
+
         for (size_t i = 0; i < nq; i++) {
-            // count how many of the true top-r neighbors appear in retrieved top-r
-            auto count_hits = [&](size_t r) -> int {
-                int hits = 0;
-                for (size_t j = 0; j < r; j++)
-                    for (size_t g = 0; g < r; g++)
-                        if (I[i * k + j] == I_gt[i * k + g]) hits++;
-                return hits;
-            };
-            r1   += count_hits(1)   / float(1);
-            r10  += count_hits(10)  / float(10);
-            r100 += count_hits(100) / float(100);
+            fr1   += recall_at_r(i, 1,   I_frozen);
+            fr10  += recall_at_r(i, 10,  I_frozen);
+            fr100 += recall_at_r(i, 100, I_frozen);
+            mr1   += recall_at_r(i, 1,   I_mutable);
+            mr10  += recall_at_r(i, 10,  I_mutable);
+            mr100 += recall_at_r(i, 100, I_mutable);
         }
-        // average across all queries
-        return {r1 / nq, r10 / nq, r100 / nq};
+        return {
+            {fr1 / nq, fr10 / nq, fr100 / nq},
+            {mr1 / nq, mr10 / nq, mr100 / nq}
+        };
     };
 
     // -------------------------------------------------- output CSV
     std::ofstream metrics_file("recall_metrics.csv");
-    metrics_file << "index_ntotal,gt_ntotal,R@1,R@10,R@100\n";
+    metrics_file << "gt_ntotal,frozen_ntotal,mutable_ntotal,"
+                    "frozen_R@1,frozen_R@10,frozen_R@100,"
+                    "mutable_R@1,mutable_R@10,mutable_R@100\n";
 
-    // ----------------------------------------- recall at the initial snapshot
-    // At this point index and gt_index are identical, so recall should be
-    // close to 1.0 (not exactly 1.0 because IVF with nprobe=64 is approximate).
-    {
-        auto [r1, r10, r100] = measure_recall();
-        printf("[%.3f s] index=%7lld  gt=%7lld  R@1=%.4f  R@10=%.4f  R@100=%.4f  [snapshot]\n",
-               elapsed() - t0, index->ntotal, gt_index->ntotal, r1, r10, r100);
-        metrics_file << index->ntotal << "," << gt_index->ntotal << ","
-                     << r1 << "," << r10 << "," << r100 << "\n";
-    }
+    auto log_and_print = [&](const char* tag) {
+        auto [frozen_rs, mutable_rs] = measure_recalls();
+        auto [fr1, fr10, fr100] = frozen_rs;
+        auto [mr1, mr10, mr100] = mutable_rs;
+        printf("[%.3f s] gt=%7lld  frozen=%7lld  mutable=%7lld  "
+               "frozen(%.3f/%.3f/%.3f)  mutable(%.3f/%.3f/%.3f)  %s\n",
+               elapsed() - t0, gt_index->ntotal,
+               frozen_index->ntotal, mutable_index->ntotal,
+               fr1, fr10, fr100, mr1, mr10, mr100, tag);
+        metrics_file << gt_index->ntotal << ","
+                     << frozen_index->ntotal << ","
+                     << mutable_index->ntotal << ","
+                     << fr1 << "," << fr10 << "," << fr100 << ","
+                     << mr1 << "," << mr10 << "," << mr100 << "\n";
+    };
 
-    // ---------------------------------------------- mutation + staleness loop
-    // Each iteration adds a batch of vectors to the ground truth index only.
-    // The frozen IVF index never sees these vectors, so recall degrades
-    // as the dataset drifts further from the snapshot.
+    // ------------------------------------------- recall at initial snapshot
+    log_and_print("[snapshot]");
+
+    // ---------------------------------------------- mutation loop
+    // Each iteration adds a batch of vectors to both the ground-truth index
+    // AND the mutable index. The frozen index is deliberately left alone.
     size_t n_remaining = nb - n_initial;
     size_t n_batches   = n_remaining / batch_size;
 
@@ -211,41 +246,40 @@ int main() {
     for (size_t b = 0; b < n_batches; b++) {
         size_t offset = n_initial + b * batch_size;
 
-        // mutate the live dataset — ground truth index tracks this
+        // mutate ground truth (source of truth)
         gt_index->add(batch_size, xb + offset * d);
 
-        // frozen index deliberately NOT updated:
-        // index->add(batch_size, xb + offset * d);
+        // mutate mutable IVF index — this is what your research is testing
+        mutable_index->add(batch_size, xb + offset * d);
+
+        // frozen index deliberately NOT updated
 
         if ((b + 1) % measure_every == 0) {
-            auto [r1, r10, r100] = measure_recall();
-            printf("[%.3f s] index=%7lld  gt=%7lld  R@1=%.4f  R@10=%.4f  R@100=%.4f\n",
-                   elapsed() - t0, index->ntotal, gt_index->ntotal, r1, r10, r100);
-            metrics_file << index->ntotal << "," << gt_index->ntotal << ","
-                         << r1 << "," << r10 << "," << r100 << "\n";
+            log_and_print("");
         }
     }
 
     // ---------------------------------------------------- flush remainder
-    size_t added_to_gt = n_initial + n_batches * batch_size;
-    if (added_to_gt < nb) {
-        gt_index->add(nb - added_to_gt, xb + added_to_gt * d);
-        auto [r1, r10, r100] = measure_recall();
-        printf("[%.3f s] index=%7lld  gt=%7lld  R@1=%.4f  R@10=%.4f  R@100=%.4f  [final]\n",
-               elapsed() - t0, index->ntotal, gt_index->ntotal, r1, r10, r100);
-        metrics_file << index->ntotal << "," << gt_index->ntotal << ","
-                     << r1 << "," << r10 << "," << r100 << "\n";
+    size_t added_so_far = n_initial + n_batches * batch_size;
+    if (added_so_far < nb) {
+        size_t leftover = nb - added_so_far;
+        gt_index->add(leftover, xb + added_so_far * d);
+        mutable_index->add(leftover, xb + added_so_far * d);
+        log_and_print("[final]");
     }
 
     // ---------------------------------------------------------------- cleanup
     metrics_file.close();
-    delete[] I;
-    delete[] D;
+    delete[] I_frozen;
+    delete[] D_frozen;
+    delete[] I_mutable;
+    delete[] D_mutable;
     delete[] I_gt;
     delete[] D_gt;
     delete[] xb;
     delete[] xq;
     delete gt_index;
-    delete index;
+    delete frozen_index;    // will delete frozen_quantizer via own_fields
+    delete mutable_index;   // will delete mutable_quantizer via own_fields
     return 0;
 }
